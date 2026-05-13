@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>CUDA 平行計算期末專題 — Bilateral Filter</title>
+</head>
+<body>
+
+<h1>CUDA 平行計算期末專題 — 雙邊濾波器 (Bilateral Filter) 的 GPU 加速</h1>
+
+<p><b>專題類別:</b> 影像處理 / GPU 平行運算<br>
+<b>實作語言:</b> C++ / CUDA C<br>
+<b>編譯環境:</b> CUDA 12.0,nvcc release 12.0 V12.0.140<br>
+<b>目標 GPU 架構:</b> sm_75 (Turing,GTX 16xx / RTX 20xx)</p>
+
+<h2>摘要 (Abstract)</h2>
+<p>雙邊濾波器 (Bilateral Filter) 是一種能在去除影像雜訊的同時 <b>保留邊緣</b> 的非線性濾波,廣泛用於相片美化、HDR tone mapping、Stylization、醫學影像處理等。然而它的計算成本遠高於一般 Gaussian 濾波 — 因為對每個像素都需要根據鄰居的色彩相似度即時計算權重,無法事先預存單一卷積核。本專題以 CUDA 實作三個版本:</p>
+<ol>
+<li><b>CPU baseline</b> — 序列版,作為正確性與效能基準。</li>
+<li><b>GPU naive</b> — 每個 thread 處理一個像素,鄰居皆從 global memory 讀取。</li>
+<li><b>GPU shared</b> — block tile 載入 shared memory + 空間 Gaussian 權重存放於 constant memory。</li>
+</ol>
+<p>本報告分析三個版本在不同濾波半徑與影像尺寸下的效能差異,並討論記憶體層級對效能的決定性影響。</p>
+
+<h2>1. 簡介與動機</h2>
+<p>雙邊濾波由 Tomasi & Manduchi (1998) 提出。它的核心想法是:在計算一個像素的輸出時,鄰居的權重 <b>不只看空間距離</b>,還要看 <b>色彩 (intensity) 上的相似度</b>。空間越近、顏色越像的鄰居權重越高;反之則貢獻很小。這使它擁有 Gaussian 濾波辦不到的「保邊」特性 — 當鄰居跨過一個強邊緣 (例如從紅色塊跳到藍色塊),range 權重會驟降到接近零,於是邊緣不會被模糊。</p>
+<p>但這個美好特性的代價是計算量:傳統 Gaussian 濾波因為權重和輸入無關,可以分離成兩個 1D 卷積,複雜度為 O(N · k)。雙邊濾波因為權重 <b>依賴中心像素的色值</b>,無法分離,複雜度為 <b>O(N · k²)</b>,且每個鄰居都要算一個 <code>exp()</code>。在 1024 × 1024、半徑 r=5 的設定下,單張影像需要約 1.27 億次權重評估 — 對 CPU 是壓力,對 GPU 卻是再好不過的 embarrassingly parallel 工作。</p>
+
+<h2>2. 雙邊濾波器原理</h2>
+<p>輸出像素 <i>I'(p)</i> 的定義如下 (以彩色影像為例):</p>
+<pre>
+            Σ<sub>q ∈ Ω(p)</sub>  G<sub>σs</sub>(‖p − q‖) · G<sub>σr</sub>(‖I(p) − I(q)‖) · I(q)
+I'(p)  =  ─────────────────────────────────────────────────────────────
+            Σ<sub>q ∈ Ω(p)</sub>  G<sub>σs</sub>(‖p − q‖) · G<sub>σr</sub>(‖I(p) − I(q)‖)
+</pre>
+<p>其中:</p>
+<ul>
+<li><b>G<sub>σs</sub>(d)</b>:空間 Gaussian,<code>exp(-d² / 2σ<sub>s</sub>²)</code>。控制濾波的「空間範圍」。</li>
+<li><b>G<sub>σr</sub>(Δ)</b>:range Gaussian,<code>exp(-Δ² / 2σ<sub>r</sub>²)</code>。控制「顏色相似度」的容忍度,Δ 為中心像素與鄰居像素的 RGB 距離。</li>
+<li><b>Ω(p)</b>:以 p 為中心、半徑 r 的方形視窗,共 (2r+1)² 個鄰居。</li>
+</ul>
+<p>分母作為正規化項,使輸出強度保持在合理範圍。實作上 σ<sub>s</sub> 通常設為 2~5,σ<sub>r</sub> 在 [10, 60] 之間 (8-bit 影像)。</p>
+
+<h2>3. 演算法複雜度分析</h2>
+<p>令影像大小為 N = W·H,濾波半徑 r、視窗邊長 k = 2r+1,則:</p>
+<ul>
+<li><b>計算複雜度:</b> O(N · k²)。每個輸出像素要對 k² 個鄰居算一次 exp,並做加總。</li>
+<li><b>記憶體存取:</b> 每個鄰居要讀一次輸入,若 naive 實作則為 N · k² 次 global memory 載入。但任一鄰居其實會被約 k² 個輸出像素重複使用 — 這正是 <b>shared memory tile</b> 能取得大幅加速的原因。</li>
+<li><b>是否可分離:</b> 否。range 權重依賴中心像素值,故無法像 Gaussian 那樣拆成 row + column 兩個 1D 卷積。這也讓 bilateral filter 成為「同等複雜度」的算法中對 GPU 最友善的之一 — 計算密度高,且每個輸出像素獨立。</li>
+</ul>
+
+<h2>4. CUDA 平行化設計</h2>
+<h3>4.1 Thread 對應</h3>
+<p>採用 2D thread 配置,<code>blockDim = (16, 16)</code>,grid 大小為 <code>⌈W/16⌉ × ⌈H/16⌉</code>。<b>每個 thread 負責輸出一個像素</b>。這是 image-processing kernel 的標準配置,理由:</p>
+<ul>
+<li>16×16 = 256 個 thread,正好等於 8 個 warp,可被 SM scheduler 充分利用。</li>
+<li>在 Turing (sm_75) 上,每個 SM 可常駐 1024 thread,所以一個 SM 可同時容納 4 個這種 block,enable 充分的 warp-level latency hiding。</li>
+<li>2D 配置使「相鄰 thread 對應相鄰像素」,鄰居資料的存取在空間上連續,有利 coalesced load 與 shared memory reuse。</li>
+</ul>
+
+<h3>4.2 Memory hierarchy 策略</h3>
+<p>本專題的優化核心是讓「資料離計算單元越近越好」:</p>
+<ul>
+<li><b>Global memory:</b> 容量大但延遲高 (~400-800 cycles)。每個 byte 只要被讀一次就 OK。</li>
+<li><b>Shared memory:</b> 每個 SM 一塊,延遲類似 register (~20-30 cycles)。同一 block 內所有 thread 共享 — 適合用來放「block 內反覆使用的鄰居資料」。</li>
+<li><b>Constant memory:</b> 64 KB,有 broadcast cache,當一個 warp 內所有 thread 讀同一個位址時,只花一次存取的成本。<b>非常適合空間 Gaussian 權重</b> — 因為 G<sub>σs</sub>(dx, dy) 對所有 thread 都相同 (只依賴 dx, dy)。</li>
+<li><b>Registers:</b> 中心像素值、累加器 (wsum, sr, sg, sb) 都放在 register。</li>
+</ul>
+
+<h2>5. 三個版本實作細節</h2>
+
+<h3>5.1 CPU baseline (<code>src/bilateral_cpu.cpp</code>)</h3>
+<p>直接照公式雙重迴圈實作,主要目的是 (a) 正確性參照、(b) 提供 speedup 基準。為了能 fair 比較,使用 <code>-O3</code> 編譯,並用 <code>std::chrono::high_resolution_clock</code> 計時。</p>
+<p>注意這是 <b>單執行緒</b> 版本。若使用 OpenMP 多核並行,Ryzen 5 7600X (6 核 12 緒) 可以再提速約 8-10×,但即使如此仍遠落後 GPU 版本。</p>
+
+<h3>5.2 GPU naive 版本 (<code>bilateral_naive_kernel</code>)</h3>
+<p>結構:</p>
+<pre>
+__global__ void bilateral_naive_kernel(...) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    // 載入中心像素到 register
+    // for dy in [-R, R]:
+    //   for dx in [-R, R]:
+    //     從 global memory 讀鄰居
+    //     計算 spatial × range 權重
+    //     累加
+    // 寫出歸一化後的結果
+}
+</pre>
+<p>關鍵改良 (相對於 textbook CPU 寫法):</p>
+<ul>
+<li>使用 <code>__expf()</code> 而非 <code>expf()</code> — Intrinsic 版本走 SFU (special function unit),速度約快 5-10×,精度略降但對 8-bit 影像影響可忽略。</li>
+<li>編譯加上 <code>--use_fast_math</code>,進一步啟用 fast div / sqrt。</li>
+<li>邊界處理用 clamp (重複邊緣像素),避免分支造成 warp divergence。</li>
+</ul>
+<p>瓶頸:同一個鄰居會被約 k² 個 thread 反覆從 global memory 讀取,造成大量重複載入。雖然 L1 / L2 cache 可吸收一部分,但仍是頻寬瓶頸。</p>
+
+<h3>5.3 GPU shared 版本 (<code>bilateral_shared_kernel&lt;TILE&gt;</code>)</h3>
+<p>這是優化的重點。每個 block 處理 16×16 個輸出像素,但需要 <b>(16 + 2r) × (16 + 2r)</b> 的輸入區域 (包含 halo)。例如 r=5 時 shared tile 為 26×26×3 = 2028 bytes,遠在 sm_75 的 shared memory 限制 (48 KB) 之內。</p>
+<p>實作要點:</p>
+<ol>
+<li><b>協作載入 halo:</b> 用一個 strided 雙重迴圈讓 256 個 thread 把 26×26 的 halo region 從 global memory 搬到 shared memory。每個 thread 可能要負責多個 shared 位置,使用 <code>for (sy = threadIdx.y; sy &lt; SW; sy += blockDim.y)</code> 的 pattern。</li>
+<li><b>__syncthreads():</b> 載入完才開始計算。</li>
+<li><b>空間權重從 constant memory 讀:</b> Host 端在 kernel 啟動前算好 (2R+1)² 個 G<sub>σs</sub>(dx, dy) 值,用 <code>cudaMemcpyToSymbol</code> 傳到 <code>__constant__ float c_spatial_weights[]</code>。kernel 內以 broadcast cache 讀取,延遲與 register 相當。</li>
+<li><b>Range 權重於 register 計算:</b> 中心像素值載入 register 後,每個鄰居只算一次 RGB 距離與一次 <code>__expf</code>。</li>
+</ol>
+<p>主要效能提升來源:</p>
+<ul>
+<li><b>Global memory traffic 大幅減少:</b> Naive 版本每個 byte 平均被讀 ~k² 次;Shared 版本每個 byte 在 block 內只從 global 讀一次,後續從 shared memory 取用。對 r=5 (k=11),理論上 global traffic 可降到 1/121,實測限於 cache 命中通常是 5~10×。</li>
+<li><b>免除每次重算 spatial weight:</b> Constant memory 一次定義、broadcast 給所有 thread。</li>
+</ul>
+
+<h2>6. 實驗環境</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th align="left">項目</th><th align="left">規格</th></tr>
+<tr><td>CPU</td><td>AMD Ryzen 5 7600X (6 核 12 緒, base 4.7 GHz)</td></tr>
+<tr><td>RAM</td><td>30 GB DDR5</td></tr>
+<tr><td>GPU</td><td>NVIDIA GeForce GTX 1660 SUPER (TU116, sm_75)<br>1408 CUDA cores, 6 GB GDDR6, ~336 GB/s BW</td></tr>
+<tr><td>OS</td><td>Linux 6.17.0</td></tr>
+<tr><td>CUDA Toolkit</td><td>12.0, nvcc V12.0.140</td></tr>
+<tr><td>編譯選項</td><td><code>-O3 -arch=sm_75 --use_fast_math</code></td></tr>
+<tr><td>計時方式</td><td>GPU 用 <code>cudaEvent</code> (僅 kernel 部分,不含 H2D/D2H)<br>CPU 用 <code>std::chrono::high_resolution_clock</code></td></tr>
+</table>
+
+<h2>7. 效能評估</h2>
+
+<h3>7.1 CPU baseline (1024 × 1024,σ<sub>s</sub>=3.0, σ<sub>r</sub>=30.0,3 次平均)</h3>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>radius</th><th>window</th><th>每像素鄰居數</th><th>CPU 時間 (ms)</th></tr>
+<tr><td>2</td><td>5×5</td><td>25</td><td align="right">140.3</td></tr>
+<tr><td>3</td><td>7×7</td><td>49</td><td align="right">246.5</td></tr>
+<tr><td>5</td><td>11×11</td><td>121</td><td align="right">584.1</td></tr>
+<tr><td>7</td><td>15×15</td><td>225</td><td align="right">1085.3</td></tr>
+<tr><td>9</td><td>19×19</td><td>361</td><td align="right">1734.8</td></tr>
+</table>
+<p>CPU 時間和鄰居數呈近似線性 — 符合 O(N · k²) 分析。</p>
+
+<h3>7.2 CPU 在不同影像尺寸 (radius=5)</h3>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>影像大小</th><th>像素數</th><th>CPU 時間 (ms)</th></tr>
+<tr><td>512 × 512</td><td>262,144</td><td align="right">159.9</td></tr>
+<tr><td>1024 × 1024</td><td>1,048,576</td><td align="right">584.1</td></tr>
+<tr><td>2048 × 2048</td><td>4,194,304</td><td align="right">2333.5</td></tr>
+</table>
+<p>時間與像素數呈線性比例 (4x 像素 → 4x 時間) — 演算法本身擴展性正常,瓶頸是常數很大。</p>
+
+<h3>7.3 GPU 版本實測</h3>
+<p>實測方式:對每組設定先跑 1 次 warm-up,再連續量 5 次,取中位數。GPU 時間由 <code>cudaEvent</code> 量測,僅含 kernel 執行,不含 H2D / D2H。MAE 為 GPU 輸出與 CPU baseline 在所有像素上的平均絕對誤差。</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr>
+  <th>設定</th>
+  <th>CPU</th>
+  <th>GPU Naive</th>
+  <th>GPU Shared</th>
+  <th>Naive Speedup</th>
+  <th>Shared Speedup</th>
+  <th>Shared / Naive</th>
+  <th>MAE</th>
+</tr>
+<tr>
+  <td>1024² r=3</td>
+  <td align="right">241.5 ms</td>
+  <td align="right">0.69 ms</td>
+  <td align="right">0.49 ms</td>
+  <td align="right">351×</td>
+  <td align="right">497×</td>
+  <td align="right">1.41×</td>
+  <td align="right">0.000</td>
+</tr>
+<tr>
+  <td>1024² r=5</td>
+  <td align="right">595.0 ms</td>
+  <td align="right">1.54 ms</td>
+  <td align="right">1.09 ms</td>
+  <td align="right">386×</td>
+  <td align="right">547×</td>
+  <td align="right">1.41×</td>
+  <td align="right">0.000</td>
+</tr>
+<tr>
+  <td>1024² r=7</td>
+  <td align="right">1100.6 ms</td>
+  <td align="right">2.80 ms</td>
+  <td align="right">2.79 ms</td>
+  <td align="right">393×</td>
+  <td align="right">394×</td>
+  <td align="right">1.00×</td>
+  <td align="right">0.000</td>
+</tr>
+<tr>
+  <td>2048² r=5</td>
+  <td align="right">2388.7 ms</td>
+  <td align="right">6.07 ms</td>
+  <td align="right">4.28 ms</td>
+  <td align="right">394×</td>
+  <td align="right">559×</td>
+  <td align="right">1.42×</td>
+  <td align="right">0.000</td>
+</tr>
+</table>
+
+<p><b>觀察:</b></p>
+<ul>
+<li><b>GPU naive 已經非常快 (350~395×)。</b> GTX 1660 SUPER 上 <code>__expf</code> 透過 SFU 執行的吞吐量極高,加上 <code>--use_fast_math</code> 與良好的 coalesced load,即使 naive 版本也能把 CPU 拉開兩個半數量級。這也提醒我們:對「單執行緒 CPU」做比較容易高估 speedup,實際應用上若 CPU 上有 OpenMP 多核 (8~10×) 加速,GPU/CPU 的差距會降到 40~60×,但仍非常顯著。</li>
+<li><b>Shared 在 r=3 / r=5 / 2048² 取得穩定的 ~1.4× 額外加速。</b> 與「shared memory 把鄰居 reuse 從 global memory 移到 on-chip」的預期一致。值得注意的是,實測比例 (1.4×) 低於理論上鄰居 reuse 數 (~k²),這是因為 GTX 1660 SUPER 的 L1/L2 cache 已經吸收了 naive 版本的大部分重複載入 — 在 sm_75 上 unified L1 cache 為 64 KB/SM,對 26×26×3 ≈ 2 KB 的 working set 命中率非常高。</li>
+<li><b>r=7 在 1024² 是個有趣的例外:shared 與 naive 幾乎相同 (2.79 vs 2.80 ms)。</b> 詳見下方分析。</li>
+<li><b>MAE 全部為 0.000。</b> GPU 與 CPU 輸出在四捨五入到 8-bit 後完全一致 — <code>__expf</code> 帶來的 FP32 誤差皆遠小於 0.5,經 <code>(uint8_t)</code> 轉型後消失。這驗證了 <code>--use_fast_math</code> 對 8-bit 影像不會產生可見差異。</li>
+</ul>
+
+<h4>7.3.1 為何 r=7 時 shared kernel 失去優勢?</h4>
+<p>進一步分析:</p>
+<ul>
+<li><b>Shared tile 變大,佔用增加:</b> r=7 時 halo region 為 <code>(16+14)² × 3 = 2700 bytes</code> 的 shared memory per block (r=5 時為 2028 bytes)。本身仍遠小於 48 KB 限制,但加上 register 使用量,Turing 上每 SM 可常駐的 block 數仍可能從 4 降到 3,降低 occupancy 與 latency hiding 能力。</li>
+<li><b>Halo 載入 overhead 與計算量比例失衡:</b> 載入 halo 是序列性的 (256 個 thread 要搬 30² = 900 個像素),halo 載入時間隨 <code>(TILE + 2r)²</code> 平方成長,而 block 內計算量隨 <code>TILE² · (2r+1)²</code> 成長 — 當 r 變大時 halo 載入的「相對 overhead」反而是固定的(都是 ~k²/TILE² 的比例),但 <code>__syncthreads()</code> 帶來的固定同步成本被攤薄得不夠多。</li>
+<li><b>Naive 版的 cache 命中已經非常好:</b> r=7 (window 15×15) 在 GTX 1660 SUPER 的 L1/L2 上仍能完全裝下 working set。在 cache 命中良好時,shared memory 的優勢 (~20-30 cycles vs L1 ~30 cycles) 不再明顯。</li>
+</ul>
+<p>這個現象的啟示是:<b>shared memory tile 的收益並非「半徑越大越好」</b>。對足夠大的半徑,效益會被 occupancy 下降與 halo 載入成本抵銷;真正能持續勝出的優化需要轉向 thread coarsening 或 register tiling。</p>
+
+<h4>7.3.2 計算吞吐量參考</h4>
+<p>以 1024² r=5 (shared, 1.09 ms) 為例,單張影像需要 ~1.27 億次權重評估,每次評估約 12 FLOPS (RGB 距離 + spatial weight 乘法 + __expf + 累加),總計約 <b>1.4 G operations / image</b>。在 1.09 ms 內完成相當於 <b>~1.3 TOPS</b>,約為 GTX 1660 SUPER 理論峰值 (5 TFLOPS FP32) 的 26%。考慮 <code>__expf</code> 走 SFU、有少量 shared memory bank conflict 風險、以及 wsum 後的除法,這個利用率是合理的。</p>
+
+<h3>7.4 視覺結果驗證</h3>
+<p>合成測試影像為 1024×1024,包含:多個飽和色塊邊緣 (測試「保邊」)、一條細亮環 (測試「保留細節」)、以及高斯雜訊 σ=18 (測試「去雜訊」能力)。經 bilateral filter (r=5, σ<sub>s</sub>=3, σ<sub>r</sub>=30) 後:</p>
+<ul>
+<li>色塊內部的雜訊被平滑掉。</li>
+<li>色塊間的邊緣 <b>保持銳利</b>,不會像 Gaussian 模糊那樣變糊。</li>
+<li>細亮環因為亮度差遠大於 σ<sub>r</sub>,被視為「跨邊緣」,得以保留。</li>
+</ul>
+<p>輸出影像存於 <code>data/out_*.ppm</code>,GPU 版與 CPU 版的 MAE (Mean Absolute Error) 在程式中即時印出 — 由於皆使用相同公式且採 IEEE 754 single-precision,理論誤差應 ≤ 1 (因 <code>__expf</code> 與 <code>expf</code> 精度略有不同)。實測 MAE 為 <b>0.000</b>(見 7.3 表格),驗證 <code>--use_fast_math</code> 對 8-bit 輸出不會產生可見差異。</p>
+
+<h2>8. 進一步優化方向 (未實作)</h2>
+<p>本專題限定範圍為「shared memory tile + constant memory weights」,但仍有許多進階優化空間,可作為延伸研究:</p>
+<ul>
+<li><b>Texture memory / __ldg():</b> 將輸入綁定為 texture object,利用 read-only cache,通常能再壓榨 5-15% 的效能。</li>
+<li><b>每 thread 處理多像素 (ILP):</b> 改成 thread coarsening,例如每個 thread 算 2×2 個輸出,可放大 register reuse 並降低 thread launch overhead。</li>
+<li><b>Half precision (FP16) 累加:</b> 利用 Turing 的 FP16x2 指令,加速 range 距離計算。</li>
+<li><b>近似快速雙邊濾波:</b> Bilateral Grid (Chen et al., 2007) 或 Permutohedral Lattice (Adams et al., 2010) 可將複雜度降至 O(N),但會略損精度。</li>
+<li><b>多 stream / overlap:</b> 對影片串流處理時,可重疊 H2D / kernel / D2H,進一步隱藏 PCIe 傳輸時間。</li>
+</ul>
+
+<h2>9. 結論</h2>
+<p>本專題完整實作了 CPU baseline 與兩個 CUDA 版本的雙邊濾波器,並在 GTX 1660 SUPER 上完成實測。1024×1024 / r=5 設定下,CPU 需 595 ms、GPU naive 1.54 ms、GPU shared 1.09 ms — 相對於單執行緒 CPU 分別取得 <b>386×</b> 與 <b>547×</b> 加速,且輸出與 CPU 像素級完全一致 (MAE = 0)。這證明 bilateral filter 是 GPU 加速的經典正面案例。</p>
+<p>本專題同時得出兩個值得記住的觀察:</p>
+<ul>
+<li><b>「memory hierarchy 的善用」確實有效,但效益會收斂。</b> 在 r=3 / r=5 / 2048² 三組設定下 shared 比 naive 多 1.4× 加速;但 r=7 時兩者打平 — 因為 GTX 1660 SUPER 的 L1/L2 cache 已能吸收 naive 版的重複載入,而 shared 版的 halo 載入 overhead 與 occupancy 下降反而抵銷其優勢。</li>
+<li><b>對「單執行緒 CPU」的 350-580× speedup 看起來很驚人,但須誠實看待。</b> 若 CPU 加上 OpenMP 多核可再快 8-10×,實際差距會降到 40-60×。但這仍是足以將「離線批次處理」變成「即時影片濾波」的等級差距。</li>
+</ul>
+<p>更深層的教訓是 CUDA 編程那句老話 — <b>運算可以很快,但資料搬運往往才是真正的瓶頸</b>。而本專題的結果還補了一句:當資料搬運不再是瓶頸 (cache 命中夠好) 時,要再優化就得另尋他路 (thread coarsening、register tiling、近似演算法)。</p>
+
+<h2>附錄 A:編譯與執行</h2>
+<pre>
+# 進入專案目錄
+cd /home/egger/cuda_class
+
+# 編譯 (預設 sm_75;若用其他 GPU 請覆寫,例如 RTX 30xx → sm_86)
+make
+make SM_ARCH=sm_86      # 例:Ampere
+
+# 產生測試影像 (1024×1024)
+make data/test.ppm
+
+# 執行單一設定:radius=5, sigma_s=3.0, sigma_r=30.0
+make run
+
+# 執行三組 radius 比較
+make test
+
+# 自訂參數
+./build/bilateral data/test.ppm data/out.ppm 7 5.0 40.0
+#                          input         output  r  σs   σr
+</pre>
+
+<h2>附錄 B:專案結構</h2>
+<pre>
+cuda_class/
+├── Makefile
+├── include/
+│   ├── ppm.h              ← PPM I/O 介面
+│   └── bilateral.h        ← Filter API 與參數結構
+├── src/
+│   ├── ppm.cpp            ← P6 PPM 讀寫
+│   ├── bilateral_cpu.cpp  ← CPU baseline + 正確性比對工具
+│   ├── bilateral_cuda.cu  ← 兩個 CUDA kernel 與 host wrappers
+│   └── main.cu            ← Benchmark driver
+├── tools/
+│   └── gen_image.cpp      ← 合成測試影像產生器
+├── data/                  ← 測試輸入 / 輸出影像
+└── build/                 ← 編譯產物
+</pre>
+
+<h2>附錄 C:重要程式碼片段</h2>
+
+<h3>Shared memory kernel 核心迴圈</h3>
+<pre>
+template &lt;int TILE&gt;
+__global__ void bilateral_shared_kernel(const uint8_t* in, uint8_t* out,
+                                        int W, int H, int R, float inv_two_sr2) {
+    extern __shared__ uint8_t s_mem[];
+    const int SW = TILE + 2 * R;
+    const int gx0 = blockIdx.x * TILE;
+    const int gy0 = blockIdx.y * TILE;
+
+    // 1. 協作載入 halo region 到 shared memory
+    for (int sy = threadIdx.y; sy &lt; SW; sy += blockDim.y) {
+        for (int sx = threadIdx.x; sx &lt; SW; sx += blockDim.x) {
+            int gx = clamp_int(gx0 + sx - R, 0, W - 1);
+            int gy = clamp_int(gy0 + sy - R, 0, H - 1);
+            int gi = (gy * W + gx) * 3;
+            int si = (sy * SW + sx) * 3;
+            s_mem[si + 0] = in[gi + 0];
+            s_mem[si + 1] = in[gi + 1];
+            s_mem[si + 2] = in[gi + 2];
+        }
+    }
+    __syncthreads();
+
+    // 2. 每個 thread 算一個輸出像素 — 鄰居皆從 shared memory 取
+    //    空間權重直接從 constant memory broadcast
+    const int sx_c = threadIdx.x + R, sy_c = threadIdx.y + R;
+    const int sci = (sy_c * SW + sx_c) * 3;
+    const float cr = s_mem[sci + 0], cg = s_mem[sci + 1], cb = s_mem[sci + 2];
+    const int WSIZE = 2 * R + 1;
+    float wsum = 0, sr = 0, sg = 0, sb = 0;
+
+    for (int dy = -R; dy &lt;= R; ++dy)
+        for (int dx = -R; dx &lt;= R; ++dx) {
+            int si = ((sy_c + dy) * SW + (sx_c + dx)) * 3;
+            float r = s_mem[si + 0], g = s_mem[si + 1], b = s_mem[si + 2];
+            float spatial_w = c_spatial_weights[(dy + R) * WSIZE + (dx + R)];
+            float dr = r - cr, dg = g - cg, db = b - cb;
+            float range = (dr*dr + dg*dg + db*db) * inv_two_sr2;
+            float w = spatial_w * __expf(-range);
+            wsum += w; sr += w*r; sg += w*g; sb += w*b;
+        }
+
+    float inv = 1.0f / wsum;
+    int gi = ((gy0 + threadIdx.y) * W + (gx0 + threadIdx.x)) * 3;
+    out[gi + 0] = (uint8_t)fminf(255.0f, fmaxf(0.0f, sr * inv));
+    out[gi + 1] = (uint8_t)fminf(255.0f, fmaxf(0.0f, sg * inv));
+    out[gi + 2] = (uint8_t)fminf(255.0f, fmaxf(0.0f, sb * inv));
+}
+</pre>
+
+<h2>附錄 D:參考資料</h2>
+<ul>
+<li>C. Tomasi and R. Manduchi, "Bilateral Filtering for Gray and Color Images," ICCV 1998.</li>
+<li>S. Paris et al., "Bilateral Filtering: Theory and Applications," Foundations and Trends in Computer Graphics and Vision, 2009.</li>
+<li>NVIDIA, "CUDA C++ Programming Guide," v12.x.</li>
+<li>NVIDIA Developer Blog, "Faster Parallel Reductions on Kepler" (shared memory tiling 觀念).</li>
+<li>J. Chen, S. Paris, F. Durand, "Real-time Edge-aware Image Processing with the Bilateral Grid," SIGGRAPH 2007.</li>
+</ul>
+
+</body>
+</html>
